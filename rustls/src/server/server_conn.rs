@@ -435,6 +435,22 @@ pub struct ServerConfig {
     ///
     /// [RFC8779]: https://datatracker.ietf.org/doc/rfc8879/
     pub cert_decompressors: Vec<&'static dyn compress::CertDecompressor>,
+
+    /// Allow early data (0-RTT) with stateless resumption.
+    ///
+    /// By default, rustls follows RFC 8446 Section 8.1 which recommends that 0-RTT
+    /// should only be used with stateful resumption to ensure proper replay protection.
+    /// However, it is challenging to share the session database between server nodes
+    /// in environments with multiple distributed servers.
+    /// This flag allows the server to allow 0-RTT with stateless resumption.
+    ///
+    /// When this is set to `true`, connections will be allowed to use 0-RTT
+    /// with both stateful and stateless resumption.
+    ///
+    /// This defaults to `false` for maximum security by default.
+    ///
+    /// Note: This setting only affects TLS 1.3 connections and is ignored for TLS 1.2.
+    pub zero_rtt_with_stateless_resumption: bool,
 }
 
 impl ServerConfig {

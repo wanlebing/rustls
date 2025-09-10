@@ -1345,11 +1345,14 @@ impl ExpectFinished {
         let mut payload = NewSessionTicketPayloadTls13::new(lifetime, age_add, nonce, ticket);
 
         if config.max_early_data_size > 0 {
-            if !stateless {
+            // Include max_early_data_size if:
+            // 1. Using stateful resumption, OR
+            // 2. Using stateless resumption with explicit opt-in
+            if !stateless || config.zero_rtt_with_stateless_resumption {
                 payload.extensions.max_early_data_size = Some(config.max_early_data_size);
             } else {
                 // We implement RFC8446 section 8.1: by enforcing that 0-RTT is
-                // only possible if using stateful resumption
+                // only possible if using stateful resumption by default
                 warn!("early_data with stateless resumption is not allowed");
             }
         }

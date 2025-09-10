@@ -5352,98 +5352,206 @@ mod test_quic {
         let kt = KeyType::Rsa2048;
         let provider = provider::default_provider().with_only_tls13();
 
-        let mut client_config = make_client_config(kt, &provider);
-        client_config.alpn_protocols = vec!["foo".into()];
-        client_config.enable_early_data = true;
-        client_config.resumption = Resumption::store(Arc::new(ClientStorage::new()));
-        let client_config = Arc::new(client_config);
-
-        let mut server_config = make_server_config(kt, &provider);
-        server_config.alpn_protocols = vec!["foo".into()];
-        server_config.max_early_data_size = 0xffff_ffff;
-        server_config.ticketer = provider::Ticketer::new().unwrap();
-        server_config.send_tls13_tickets = 2;
-        let server_config = Arc::new(server_config);
-
         // QUIC 0-RTT parameters to store in resumption data
         let quic_0rtt_params = b"active_connection_id_limit=2,initial_max_data=1048576,initial_max_stream_data_bidi_local=262144,initial_max_stream_data_bidi_remote=262144,initial_max_stream_data_uni=262144,initial_max_streams_bidi=100,initial_max_streams_uni=100,max_datagram_frame_size=1500";
 
-        // First connection: establish session with 0-RTT parameters
-        let mut server1 = quic::ServerConnection::new(
-            server_config.clone(),
-            quic::Version::V1,
-            server_params.to_vec(),
-        )
-        .unwrap();
+        fn verify_params(server: &quic::ServerConnection, expected_params: &[u8]) {
+            assert_eq!(
+                server.received_resumption_data(),
+                Some(expected_params),
+                "Server should receive QUIC 0-RTT parameters from resumption data"
+            );
 
-        server1.set_resumption_data(quic_0rtt_params);
-        assert_eq!(server1.received_resumption_data(), None);
+            if let Some(received_params) = server.received_resumption_data() {
+                let params_str = std::str::from_utf8(received_params).unwrap();
+                assert!(params_str.contains("active_connection_id_limit=2"));
+                assert!(params_str.contains("initial_max_data=1048576"));
+                assert!(params_str.contains("initial_max_stream_data_bidi_local=262144"));
+                assert!(params_str.contains("initial_max_stream_data_bidi_remote=262144"));
+                assert!(params_str.contains("initial_max_stream_data_uni=262144"));
+                assert!(params_str.contains("initial_max_streams_bidi=100"));
+                assert!(params_str.contains("initial_max_streams_uni=100"));
+                assert!(params_str.contains("max_datagram_frame_size=1500"));
+            }
+        }
 
-        let mut client1 = quic::ClientConnection::new(
-            client_config.clone(),
-            quic::Version::V1,
-            server_name("localhost"),
-            client_params.to_vec(),
-        )
-        .unwrap();
+        #[derive(Debug)]
+        struct NeverProducesTickets;
 
-        do_quic_handshake(&mut client1, &mut server1);
+        impl rustls::server::ProducesTickets for NeverProducesTickets {
+            fn enabled(&self) -> bool {
+                false
+            }
+            fn lifetime(&self) -> u32 {
+                0
+            }
+            fn encrypt(&self, _bytes: &[u8]) -> Option<Vec<u8>> {
+                None
+            }
+            fn decrypt(&self, _bytes: &[u8]) -> Option<Vec<u8>> {
+                None
+            }
+        }
 
-        // Verify initial connection
-        assert_eq!(client1.handshake_kind(), Some(HandshakeKind::Full));
-        assert_eq!(server1.handshake_kind(), Some(HandshakeKind::Full));
-        assert_eq!(server1.received_resumption_data(), None);
+        // Test 1: Stateful resumption (using session storage, no ticketer)
+        {
+            let mut client_config = make_client_config(kt, &provider);
+            client_config.alpn_protocols = vec!["foo".into()];
+            client_config.enable_early_data = true;
+            client_config.resumption = Resumption::store(Arc::new(ClientStorage::new()));
+            let client_config = Arc::new(client_config);
 
-        // Second connection: attempt 0-RTT resumption
-        let mut server2 =
-            quic::ServerConnection::new(server_config, quic::Version::V1, server_params.to_vec())
-                .unwrap();
+            let mut server_config = make_server_config(kt, &provider);
+            server_config.alpn_protocols = vec!["foo".into()];
+            server_config.max_early_data_size = 0xffff_ffff;
+            server_config.ticketer = Arc::new(NeverProducesTickets);
+            server_config.send_tls13_tickets = 2;
+            let server_config = Arc::new(server_config);
 
-        let mut client2 = quic::ClientConnection::new(
-            client_config,
-            quic::Version::V1,
-            server_name("localhost"),
-            client_params.to_vec(),
-        )
-        .unwrap();
+            // First connection: establish session with 0-RTT parameters
+            let mut server1 = quic::ServerConnection::new(
+                server_config.clone(),
+                quic::Version::V1,
+                server_params.to_vec(),
+            )
+            .unwrap();
 
-        // Check negotiated cipher suite for potential 0-RTT
-        assert!(
-            client2
-                .negotiated_cipher_suite()
-                .is_some()
-        );
+            server1.set_resumption_data(quic_0rtt_params);
+            assert_eq!(server1.received_resumption_data(), None);
 
-        // Start handshake and check transport parameters early
-        quic_transfer(&mut client2, &mut server2);
-        assert_eq!(
-            client2.quic_transport_parameters(),
-            Some(server_params.as_slice())
-        );
+            let mut client1 = quic::ClientConnection::new(
+                client_config.clone(),
+                quic::Version::V1,
+                server_name("localhost"),
+                client_params.to_vec(),
+            )
+            .unwrap();
 
-        // Complete the handshake (whether 0-RTT or regular resumption)
-        do_quic_handshake(&mut client2, &mut server2);
+            do_quic_handshake(&mut client1, &mut server1);
 
-        // Verify resumption worked and parameters were received
-        assert_eq!(client2.handshake_kind(), Some(HandshakeKind::Resumed));
-        assert_eq!(server2.handshake_kind(), Some(HandshakeKind::Resumed));
-        assert_eq!(
-            server2.received_resumption_data(),
-            Some(quic_0rtt_params.as_slice()),
-            "Server should receive QUIC 0-RTT parameters from resumption data"
-        );
+            // Verify initial connection
+            assert_eq!(client1.handshake_kind(), Some(HandshakeKind::Full));
+            assert_eq!(server1.handshake_kind(), Some(HandshakeKind::Full));
+            assert_eq!(server1.received_resumption_data(), None);
 
-        // Verify server can parse and use the received 0-RTT parameters
-        if let Some(received_params) = server2.received_resumption_data() {
-            let params_str = std::str::from_utf8(received_params).unwrap();
-            assert!(params_str.contains("active_connection_id_limit=2"));
-            assert!(params_str.contains("initial_max_data=1048576"));
-            assert!(params_str.contains("initial_max_stream_data_bidi_local=262144"));
-            assert!(params_str.contains("initial_max_stream_data_bidi_remote=262144"));
-            assert!(params_str.contains("initial_max_stream_data_uni=262144"));
-            assert!(params_str.contains("initial_max_streams_bidi=100"));
-            assert!(params_str.contains("initial_max_streams_uni=100"));
-            assert!(params_str.contains("max_datagram_frame_size=1500"));
+            // Second connection: attempt 0-RTT resumption
+            let mut server2 = quic::ServerConnection::new(
+                server_config,
+                quic::Version::V1,
+                server_params.to_vec(),
+            )
+            .unwrap();
+
+            let mut client2 = quic::ClientConnection::new(
+                client_config,
+                quic::Version::V1,
+                server_name("localhost"),
+                client_params.to_vec(),
+            )
+            .unwrap();
+
+            // Check negotiated cipher suite for potential 0-RTT
+            assert!(
+                client2
+                    .negotiated_cipher_suite()
+                    .is_some()
+            );
+
+            // Start handshake and check transport parameters early
+            quic_transfer(&mut client2, &mut server2);
+            assert_eq!(
+                client2.quic_transport_parameters(),
+                Some(server_params.as_slice())
+            );
+
+            // Complete the handshake (whether 0-RTT or regular resumption)
+            do_quic_handshake(&mut client2, &mut server2);
+
+            // Verify stateful resumption worked and parameters were received
+            assert_eq!(client2.handshake_kind(), Some(HandshakeKind::Resumed));
+            assert_eq!(server2.handshake_kind(), Some(HandshakeKind::Resumed));
+            verify_params(&server2, quic_0rtt_params);
+        }
+
+        // Test 2: Stateless resumption (using ticketer)
+        {
+            let mut client_config = make_client_config(kt, &provider);
+            client_config.alpn_protocols = vec!["foo".into()];
+            client_config.enable_early_data = true;
+            client_config.resumption = Resumption::store(Arc::new(ClientStorage::new()));
+            let client_config = Arc::new(client_config);
+
+            let mut server_config = make_server_config(kt, &provider);
+            server_config.alpn_protocols = vec!["foo".into()];
+            server_config.max_early_data_size = 0xffff_ffff;
+            server_config.ticketer = provider::Ticketer::new().unwrap();
+            server_config.send_tls13_tickets = 2;
+            server_config.zero_rtt_with_stateless_resumption = true;
+            let server_config = Arc::new(server_config);
+
+            // First connection: establish session with 0-RTT parameters
+            let mut server1 = quic::ServerConnection::new(
+                server_config.clone(),
+                quic::Version::V1,
+                server_params.to_vec(),
+            )
+            .unwrap();
+
+            server1.set_resumption_data(quic_0rtt_params);
+            assert_eq!(server1.received_resumption_data(), None);
+
+            let mut client1 = quic::ClientConnection::new(
+                client_config.clone(),
+                quic::Version::V1,
+                server_name("localhost"),
+                client_params.to_vec(),
+            )
+            .unwrap();
+
+            do_quic_handshake(&mut client1, &mut server1);
+
+            // Verify initial connection
+            assert_eq!(client1.handshake_kind(), Some(HandshakeKind::Full));
+            assert_eq!(server1.handshake_kind(), Some(HandshakeKind::Full));
+            assert_eq!(server1.received_resumption_data(), None);
+
+            // Second connection: attempt 0-RTT resumption with stateless tickets
+            let mut server2 = quic::ServerConnection::new(
+                server_config,
+                quic::Version::V1,
+                server_params.to_vec(),
+            )
+            .unwrap();
+
+            let mut client2 = quic::ClientConnection::new(
+                client_config,
+                quic::Version::V1,
+                server_name("localhost"),
+                client_params.to_vec(),
+            )
+            .unwrap();
+
+            // Check negotiated cipher suite for potential 0-RTT
+            assert!(
+                client2
+                    .negotiated_cipher_suite()
+                    .is_some()
+            );
+
+            // Start handshake and check transport parameters early
+            quic_transfer(&mut client2, &mut server2);
+            assert_eq!(
+                client2.quic_transport_parameters(),
+                Some(server_params.as_slice())
+            );
+
+            // Complete the handshake (whether 0-RTT or regular resumption)
+            do_quic_handshake(&mut client2, &mut server2);
+
+            // Verify stateless resumption worked and parameters were received
+            assert_eq!(client2.handshake_kind(), Some(HandshakeKind::Resumed));
+            assert_eq!(server2.handshake_kind(), Some(HandshakeKind::Resumed));
+            verify_params(&server2, quic_0rtt_params);
         }
     }
 
